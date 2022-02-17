@@ -1,0 +1,248 @@
+name: Release
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit to release'
+        required: true
+      quality:
+        description: 'Quality'
+        required: true
+        type: choice
+        options: 
+        - insiders
+        - stable
+        default: stable
+      uploadRelease:
+        description: 'Create GitHub and DockerHub Release'
+        type: boolean
+        required: true
+  workflow_run:
+    workflows: ["Insiders"]
+    types: [completed]
+
+env:
+  QUALITY: ${{ github.event.inputs.quality || 'insiders' }}
+  RELEASE_COMMIT: ${{ github.event.inputs.commit || 'main' }}
+
+jobs:
+  build-dependencies:
+    runs-on: ubuntu-latest
+    container:
+      image: gitpod/openvscode-server-linux-build-agent:centos7-devtoolset8-x64
+    name: Build native dependencies linux-x64
+    if: github.event.inputs.commit || github.event.workflow_run.conclusion == 'success'
+    steps:
+      # Get the release commit from the Insiders workflow
+      - name: Download artifact
+        if: github.event.workflow_run.conclusion == 'success'
+        uses: dawidd6/action-download-artifact@v2
+        with:
+          workflow: insiders.yml
+          name: release_commit
+      - name: Read release commit from file
+        if: github.event.workflow_run.conclusion == 'success'
+        run: |
+          echo "RELEASE_COMMIT=$(cat __release_commit.txt)" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v2
+        with:
+          repository: ${{ github.repository_owner }}/openvscode-server
+          ref: ${{ env.RELEASE_COMMIT }}
+          token: ${{ secrets.VSCODE_GITHUB_TOKEN }}
+      
+      - name: Execute yarn
+        run: |
+          set -e
+          export npm_config_arch=x64
+          yarn --cwd remote --frozen-lockfile --network-timeout 180000
+      
+      - name: Compress node_modules output
+        run: |
+          set -e
+          tar -cz --ignore-failed-read -f reh_node_modules-x64.tar.gz -C ./remote node_modules
+
+      - name: Updaload compiled dependencies
+        uses: actions/upload-artifact@v2
+        with:
+          name: reh_node_modules-x64
+          path: reh_node_modules-x64.tar.gz
+
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+      env:
+        OS_NAME: 'linux'
+        VSCODE_ARCH: ${{ matrix.vscode_arch }}
+
+    # support only linux for now
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+        - vscode_arch: x64
+          npm_arch: x64
+          image: gitpod/openvscode-server-linux-build-agent:bionic-x64
+        - vscode_arch: arm64
+          npm_arch: arm64
+          image: gitpod/openvscode-server-linux-build-agent:stretch-arm64
+        - vscode_arch: armhf
+          npm_arch: armv7l
+          image: gitpod/openvscode-server-linux-build-agent:stretch-armhf
+
+    name: Build linux-${{ matrix.vscode_arch }}
+    needs: build-dependencies
+    outputs:
+      release_commit: ${{ steps.bundle_tar.outputs.release_commit }}
+      version: ${{ steps.bundle_tar.outputs.version }}
+      quality: ${{ steps.bundle_tar.outputs.quality }}
+    steps:   
+      - uses: actions/checkout@v2
+        with:
+          repository: ${{ github.repository_owner }}/openvscode-server
+          ref: ${{ env.RELEASE_COMMIT }}
+          path: openvscode-server
+          token: ${{ secrets.VSCODE_GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v2
+        with:
+          node-version: 16
+      
+      - name: Install Yarn
+        run: npm install -g yarn
+    
+      - name: Compute node modules cache key
+        working-directory: ./openvscode-server
+        id: nodeModulesCacheKey
+        run: echo "::set-output name=value::$(node build/azure-pipelines/common/computeNodeModulesCacheKey.js)"
+      - name: Cache node modules
+        id: cacheNodeModules
+        uses: actions/cache@v2
+        with:
+          path: "openvscode-server/**/node_modules"
+          key: linux-${{ matrix.npm_arch }}-cacheNodeModules19-${{ steps.nodeModulesCacheKey.outputs.value }}
+          restore-keys: linux-${{ matrix.npm_arch }}-cacheNodeModules19-
+      - name: Get yarn cache directory path
+        working-directory: ./openvscode-server
+        id: yarnCacheDirPath
+        if: ${{ steps.cacheNodeModules.outputs.cache-hit != 'true' }}
+        run: echo "::set-output name=dir::$(yarn cache dir)"
+      - name: Cache yarn directory
+        if: ${{ steps.cacheNodeModules.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v2
+        with:
+          path: ${{ steps.yarnCacheDirPath.outputs.dir }}
+          key: linux-${{ matrix.npm_arch }}-yarnCacheDir-${{ steps.nodeModulesCacheKey.outputs.value }}
+          restore-keys: linux-${{ matrix.npm_arch }}-yarnCacheDir-
+      - name: Execute yarn
+        working-directory: ./openvscode-server
+        if: ${{ steps.cacheNodeModules.outputs.cache-hit != 'true' }}
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: 1
+          ELECTRON_SKIP_BINARY_DOWNLOAD: 1
+        run: |
+          set -e
+          export npm_config_arch=${{ matrix.npm_arch }}
+          yarn --frozen-lockfile --network-timeout 180000
+      
+      - name: Download server build dependencies
+        if: matrix.vscode_arch == 'x64'
+        uses: actions/download-artifact@v2
+        with:
+          name: reh_node_modules-x64
+          path: ./openvscode-server
+      
+      - name: Extract server node_modules output
+        if: matrix.vscode_arch == 'x64'
+        working-directory: ./openvscode-server
+        run: |
+          set -e
+          rm -rf remote/node_modules
+          tar -xzf reh_node_modules-x64.tar.gz --directory ./remote
+
+      - name: Prepare for distribution
+        working-directory: ./openvscode-server
+        run: yarn gulp vscode-reh-web-linux-${{ matrix.vscode_arch }}-min
+      
+      - name: Download playwright
+        if: matrix.vscode_arch == 'x64'
+        working-directory: ./openvscode-server
+        run: |
+          yarn playwright-install 
+
+      - name: Compile test suites
+        if: matrix.vscode_arch == 'x64'
+        working-directory: ./openvscode-server
+        run: |
+          set -e
+          yarn --cwd test/smoke compile
+          yarn --cwd test/integration/browser compile
+
+      - name: Run integration tests
+        if: matrix.vscode_arch == 'x64'
+        working-directory: ./openvscode-server
+        run: |
+          set -e
+          VSCODE_REMOTE_SERVER_PATH="$GITHUB_WORKSPACE/vscode-reh-web-linux-${{ matrix.vscode_arch }}" \
+          ./scripts/test-web-integration.sh --browser chromium
+
+      - name: Run smoke tests
+        if: matrix.vscode_arch == 'x64'
+        working-directory: ./openvscode-server
+        run: |
+          set -e
+          VSCODE_REMOTE_SERVER_PATH="$GITHUB_WORKSPACE/vscode-reh-web-linux-${{ matrix.vscode_arch }}" \
+          yarn smoketest-no-compile --web --headless --electronArgs="--disable-dev-shm-usage --use-gl=swiftshader"
+          
+      - name: Bundle tarfile
+        id: bundle_tar
+        run: |
+          set -e
+          version=$(node -p -e "require('./openvscode-server/package.json').version")
+          quality_name=$([ "$QUALITY" = "insiders" ] && echo "-insiders" || echo "")
+          name="openvscode-server${quality_name}-v${version}-linux-${{ matrix.vscode_arch }}"
+          mv vscode-reh-web-linux-${{ matrix.vscode_arch }} ${name}
+          tar -czf ${name}.tar.gz ${name}
+
+          echo "::set-output name=release_commit::${RELEASE_COMMIT}"
+          echo "::set-output name=version::${version}"
+          echo "::set-output name=quality::${QUALITY}"
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v2
+        with:
+          name: linux-${{ matrix.vscode_arch }}
+          path: openvscode-server-*.tar.gz
+
+      - name: Slack Notification
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_COLOR: ${{ job.status }}
+   
+  github-release:
+    needs: build 
+    if: github.event.inputs.uploadRelease == 'true' || github.event.workflow_run.conclusion == 'success'
+    uses: ./.github/workflows/github-release.yml
+    with:
+      release_commit: ${{ needs.build.outputs.release_commit }}
+      version: ${{ needs.build.outputs.version }}
+      stable: ${{ needs.build.outputs.quality == 'stable' }}
+    secrets:
+      VSCODE_GITHUB_TOKEN: ${{ secrets.VSCODE_GITHUB_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
+  docker-release:
+    needs: [github-release, build]
+    if: github.event.inputs.uploadRelease == 'true' || github.event.workflow_run.conclusion == 'success'
+    uses: ./.github/workflows/docker-release.yml
+    with:
+      version: ${{ needs.build.outputs.version }}
+      stable: ${{ needs.build.outputs.quality == 'stable' }}
+    secrets:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+
